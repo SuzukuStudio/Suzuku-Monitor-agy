@@ -1,0 +1,17 @@
+{
+  "name": "suzuku-monitor",
+  "displayName": "Suzuku Monitor",
+  "version": "1.2.0",
+  "description": "Orchestrator-aware live context usage, per-model prompt cache freshness timer, desktop alerts, and Remote Control mobile webhook notifications.",
+  "author": {
+    "name": "ShoutLiberte",
+    "url": "https://shoutliberte.jp"
+  },
+  "homepage": "https://shoutliberte.jp",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open the Suzuku Monitor panel to inspect current session token usage and cache status",
+    "Check whether the current conversation context is large enough to run /compact",
+    "Show the context growth history for my active session"
+  ]
+}

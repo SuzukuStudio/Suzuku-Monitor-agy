@@ -1,0 +1,16 @@
+# Dependencies
+ui-src/node_modules/
+
+# Python caches
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Release build artifacts
+dist/
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

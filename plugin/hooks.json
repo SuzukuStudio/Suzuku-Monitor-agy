@@ -1,0 +1,18 @@
+{
+  "suzuku-monitor-inline": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/context_hook.py",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/context_hook.py",
+        "timeout": 5
+      }
+    ]
+  }
+}

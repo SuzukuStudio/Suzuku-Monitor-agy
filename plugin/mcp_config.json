@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "suzuku-monitor": {
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/mcp_server.py",
+        "--data-dir",
+        "${PLUGIN_DATA}"
+      ]
+    }
+  }
+}
