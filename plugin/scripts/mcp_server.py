@@ -32,6 +32,7 @@ from transcript_parser import (  # noqa: E402
     load_settings,
     parse_transcript,
     save_settings,
+    scan_swarm_map,
 )
 
 APP_URI = "ui://suzuku-monitor/app.html"
@@ -83,6 +84,7 @@ class ContextMonitorServer:
             if just_compacted
             else (latest["contextTokens"] if latest else 0)
         )
+        swarm_info = s.get("swarm") if isinstance(s.get("swarm"), dict) else None
         return {
             "conversationId": s["conversationId"],
             "title": s["title"],
@@ -97,11 +99,28 @@ class ContextMonitorServer:
             "userTurns": s["userTurns"],
             "modelCalls": s["modelCalls"],
             "isOrchestrator": bool(s.get("isOrchestrator")),
+            "isSwarm": bool(s.get("isSwarm")),
+            "swarmWorkers": int(swarm_info.get("workerCount") or 0) if swarm_info else 0,
             "justCompacted": just_compacted,
             "isActive": bool(s.get("isActive")),
             "isMostRecent": bool(s.get("isMostRecent")),
             "mtimeMs": s.get("mtimeMs", 0),
         }
+
+    @staticmethod
+    def _remap_active_info(
+        brain_dir: Path,
+        active_info: dict[str, Any],
+        worker_to_coord: dict[str, str],
+    ) -> dict[str, Any]:
+        raw_cid = active_info.get("conversationId") or None
+        if not raw_cid or raw_cid not in worker_to_coord:
+            return active_info
+        coord_cid = worker_to_coord[raw_cid]
+        remapped = dict(active_info)
+        remapped["conversationId"] = coord_cid
+        remapped["transcriptPath"] = str(brain_dir / coord_cid / ".system_generated" / "logs" / "transcript.jsonl")
+        return remapped
 
     def _resolve_target_session(
         self,
@@ -109,15 +128,23 @@ class ContextMonitorServer:
         now_ts: float | None = None,
     ) -> dict[str, Any] | None:
         now = now_ts if now_ts is not None else time.time()
-        active_info = load_active_session(self.data_dir)
+        brain_dir = get_brain_dir()
+        raw_active = load_active_session(self.data_dir)
+        worker_to_coord, _ = scan_swarm_map(brain_dir)
+        active_info = self._remap_active_info(brain_dir, raw_active, worker_to_coord)
+        eff_requested_id = (
+            worker_to_coord.get(requested_conv_id, requested_conv_id)
+            if requested_conv_id
+            else None
+        )
         sessions = list_sessions(
-            brain_dir=get_brain_dir(),
+            brain_dir=brain_dir,
             active_info=active_info,
             limit=10,
             cache=self.parse_cache,
             now_ts=now,
         )
-        return self._pick_selected(sessions, active_info, requested_conv_id)
+        return self._pick_selected(sessions, active_info, eff_requested_id)
 
     @staticmethod
     def _pick_selected(
@@ -150,8 +177,15 @@ class ContextMonitorServer:
     def _build_snapshot(self, requested_conv_id: str | None = None) -> dict[str, Any]:
         now = time.time()
         settings = load_settings(self.data_dir)
-        active_info = load_active_session(self.data_dir)
+        raw_active = load_active_session(self.data_dir)
         brain_dir = get_brain_dir()
+        worker_to_coord, _ = scan_swarm_map(brain_dir)
+        active_info = self._remap_active_info(brain_dir, raw_active, worker_to_coord)
+        eff_requested_id = (
+            worker_to_coord.get(requested_conv_id, requested_conv_id)
+            if requested_conv_id
+            else None
+        )
         sessions = list_sessions(
             brain_dir=brain_dir,
             active_info=active_info,
@@ -173,7 +207,7 @@ class ContextMonitorServer:
                 except OSError:
                     pass
 
-        picked = self._pick_selected(sessions, active_info, requested_conv_id)
+        picked = self._pick_selected(sessions, active_info, eff_requested_id)
         selected: dict[str, Any] | None = None
         if picked is not None:
             # Always parse the selected session fresh from disk (bypassing parse_cache) for live accuracy.
@@ -223,11 +257,12 @@ class ContextMonitorServer:
         selected = snapshot.get("selected")
         if not selected:
             return "No active session transcript with model token metrics found yet."
+        orch_tag = " [Orchestrator]" if selected.get("isOrchestrator") else ""
+        swarm_tag = " [Swarm]" if selected.get("isSwarm") else ""
         if selected.get("justCompacted") and selected.get("lastCompaction"):
             lc = selected["lastCompaction"]
-            orch_tag = " [Orchestrator]" if selected.get("isOrchestrator") else ""
             return (
-                f"Session {selected['conversationId']} ({selected['title']}){orch_tag}: "
+                f"Session {selected['conversationId']} ({selected['title']}){orch_tag}{swarm_tag}: "
                 f"Compacted ({fmt_k(lc.get('beforeTokens', 0))} -> ~{fmt_k(lc.get('summaryTokens', 0))}), "
                 f"awaiting next turn to rebuild prompt cache."
             )
@@ -239,9 +274,8 @@ class ContextMonitorServer:
         pct = (ctx / limit * 100.0) if limit > 0 else 0.0
         cache_pct = round(latest["cacheHitRate"] * 100)
         idle_str = fmt_duration(selected["idleSeconds"])
-        orch_tag = " [Orchestrator]" if selected.get("isOrchestrator") else ""
         return (
-            f"Session {selected['conversationId']} ({selected['title']}){orch_tag}: "
+            f"Session {selected['conversationId']} ({selected['title']}){orch_tag}{swarm_tag}: "
             f"Context {fmt_k(ctx)} / {fmt_k(limit)} ({pct:.1f}%), "
             f"Cache hit {cache_pct}% ({fmt_k(latest['cacheReadTokens'])} hit, {fmt_k(latest['inputTokens'])} new), "
             f"Idle {idle_str}, Model {selected['model'] or 'unknown'}."

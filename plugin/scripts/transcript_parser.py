@@ -185,6 +185,20 @@ def _extract_conversation_id(path: Path) -> str:
     return path.parent.stem or path.stem
 
 
+def _resolve_conv_dir(path: Path) -> Path | None:
+    """Resolve .../brain/<conv_id> from a transcript path under .system_generated."""
+    parts = path.resolve().parts
+    for i, part in enumerate(parts):
+        if part == ".system_generated" and i >= 1:
+            return Path(*parts[:i])
+    return None
+
+
+def _is_safe_member_conv_id(conv_id: str) -> bool:
+    """Return True if conv_id is a single non-traversing path component."""
+    return bool(conv_id) and conv_id not in (".", "..") and "/" not in conv_id and "\\" not in conv_id
+
+
 def _extract_title(content: str) -> str:
     """Extract a concise display title from the first USER_INPUT content."""
     if not isinstance(content, str):
@@ -360,6 +374,244 @@ def _infer_model_role(
         if any(k in lower for k in ("neon", "carbon", "argon", "opus")):
             return "planner"
     return "primary"
+
+
+def _stat_swarm_files(swarm_dir: Path) -> tuple[int, int]:
+    """Return (max_mtime_ns, total_bytes) across core swarm metadata files."""
+    max_mtime_ns = 0
+    total_size = 0
+    for fname in ("members.json", "board.jsonl", "swarm.json", "plan.json"):
+        fpath = swarm_dir / fname
+        try:
+            st = fpath.stat()
+        except OSError:
+            continue
+        if st.st_mtime_ns > max_mtime_ns:
+            max_mtime_ns = st.st_mtime_ns
+        total_size += st.st_size
+    return max_mtime_ns, total_size
+
+
+def _parse_worker_transcript(worker_tp: Path) -> dict[str, Any]:
+    """Read lightweight status and token totals from a swarm worker's transcript."""
+    result: dict[str, Any] = {
+        "hasEntries": False,
+        "lastEntryType": None,
+        "hasModelInvocation": False,
+        "lastModelToolCalls": [],
+        "lastModel": "",
+        "calls": 0,
+        "contextTokens": 0,
+        "uncachedInput": 0,
+        "cacheRead": 0,
+        "output": 0,
+        "mtimeNs": 0,
+        "sizeBytes": 0,
+    }
+    try:
+        st = worker_tp.stat()
+    except OSError:
+        return result
+
+    result["mtimeNs"] = st.st_mtime_ns
+    result["sizeBytes"] = st.st_size
+
+    try:
+        with worker_tp.open("r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+
+                result["hasEntries"] = True
+                entry_type = entry.get("type")
+                result["lastEntryType"] = str(entry_type) if entry_type is not None else None
+                if entry_type == "USER_INPUT":
+                    continue
+                if entry_type == "CHECKPOINT" or (
+                    entry.get("source") == "SYSTEM" and not entry.get("model")
+                ):
+                    continue
+
+                has_tokens = isinstance(entry.get("input_tokens"), int) or isinstance(
+                    entry.get("cache_read_tokens"), int
+                )
+                if not has_tokens and entry_type != "PLANNER_RESPONSE":
+                    continue
+
+                result["hasModelInvocation"] = True
+                result["lastModelToolCalls"] = _extract_tool_names(entry.get("tool_calls"))
+                m_name = str(entry.get("model") or "")
+                if m_name:
+                    result["lastModel"] = m_name
+
+                if has_tokens:
+                    inp = int(entry.get("input_tokens") or 0)
+                    cr = int(entry.get("cache_read_tokens") or 0)
+                    out = int(entry.get("output_tokens") or 0)
+                    result["calls"] += 1
+                    result["contextTokens"] = inp + cr
+                    result["uncachedInput"] += inp
+                    result["cacheRead"] += cr
+                    result["output"] += out
+    except OSError:
+        return result
+
+    return result
+
+
+def _infer_worker_status(member: dict[str, Any], worker_metrics: dict[str, Any]) -> str:
+    """Infer swarm worker status ('killed', 'stopped', 'working', or 'waiting')."""
+    desired = str(member.get("desired_state") or "").lower()
+    phase = str(member.get("phase") or "").lower()
+    if bool(member.get("killed")) or desired == "killed" or phase == "killed":
+        return "killed"
+    if desired == "stopped" or phase == "stopped":
+        return "stopped"
+    if worker_metrics.get("hasEntries"):
+        if worker_metrics.get("lastEntryType") == "USER_INPUT":
+            return "working"
+        if worker_metrics.get("hasModelInvocation"):
+            tool_calls = worker_metrics.get("lastModelToolCalls") or []
+            if not tool_calls or "swarm_wait" in tool_calls:
+                return "waiting"
+            return "working"
+    return "working" if str(member.get("wake_mode") or "").lower() == "working" else "waiting"
+
+
+def _parse_swarm_info(conv_dir: Path, conv_id: str) -> tuple[bool, dict[str, Any] | None, int, int]:
+    """Parse read-only .system_generated/swarm/ state if conv_dir is a Swarm coordinator."""
+    swarm_dir = conv_dir / ".system_generated" / "swarm"
+    members_path = swarm_dir / "members.json"
+    swarm_json_path = swarm_dir / "swarm.json"
+    if not (members_path.is_file() or swarm_json_path.is_file()):
+        return False, None, 0, 0
+
+    members_data = _read_json_file(members_path)
+    raw_title = members_data.get("title")
+    swarm_title = re.sub(r"\s+", " ", raw_title).strip() if isinstance(raw_title, str) else ""
+    if not swarm_title:
+        plan_data = _read_json_file(swarm_dir / "plan.json")
+        goal = plan_data.get("goal")
+        if isinstance(goal, dict) and isinstance(goal.get("title"), str):
+            swarm_title = re.sub(r"\s+", " ", goal["title"]).strip()
+
+    board_messages = 0
+    board_path = swarm_dir / "board.jsonl"
+    try:
+        with board_path.open("r", encoding="utf-8", errors="replace") as bf:
+            for raw_line in bf:
+                s = raw_line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    board_messages += 1
+    except OSError:
+        pass
+
+    max_mtime_ns, total_size = _stat_swarm_files(swarm_dir)
+    brain_dir = conv_dir.parent
+    workers: list[dict[str, Any]] = []
+    members_raw = members_data.get("members")
+    if isinstance(members_raw, dict):
+        for name, m in members_raw.items():
+            if not isinstance(m, dict):
+                continue
+            w_cid = str(m.get("conversation_id") or "").strip()
+            if name == "coordinator" or (w_cid and w_cid == conv_id):
+                continue
+
+            worker_metrics: dict[str, Any] = {}
+            if _is_safe_member_conv_id(w_cid):
+                w_tp = brain_dir / w_cid / ".system_generated" / "logs" / "transcript.jsonl"
+                if w_tp.is_file():
+                    worker_metrics = _parse_worker_transcript(w_tp)
+                    max_mtime_ns = max(max_mtime_ns, int(worker_metrics.get("mtimeNs") or 0))
+                    total_size += int(worker_metrics.get("sizeBytes") or 0)
+
+            w_model = str(
+                m.get("applied_model")
+                or m.get("desired_model")
+                or m.get("model")
+                or worker_metrics.get("lastModel")
+                or "unknown"
+            )
+            w_status = _infer_worker_status(m, worker_metrics)
+            workers.append(
+                {
+                    "name": str(name),
+                    "role": str(m.get("role") or "worker"),
+                    "model": w_model,
+                    "status": w_status,
+                    "calls": int(worker_metrics.get("calls") or 0),
+                    "contextTokens": int(worker_metrics.get("contextTokens") or 0),
+                    "uncachedInput": int(worker_metrics.get("uncachedInput") or 0),
+                    "cacheRead": int(worker_metrics.get("cacheRead") or 0),
+                    "output": int(worker_metrics.get("output") or 0),
+                }
+            )
+
+    working_count = sum(1 for w in workers if w["status"] == "working")
+    swarm_info = {
+        "title": swarm_title,
+        "workerCount": len(workers),
+        "workingCount": working_count,
+        "boardMessages": board_messages,
+        "totals": {
+            "calls": sum(w["calls"] for w in workers),
+            "uncachedInput": sum(w["uncachedInput"] for w in workers),
+            "cacheRead": sum(w["cacheRead"] for w in workers),
+            "output": sum(w["output"] for w in workers),
+        },
+        "workers": workers,
+    }
+    return True, swarm_info, max_mtime_ns, total_size
+
+
+def scan_swarm_map(brain_dir: str | Path | None = None) -> tuple[dict[str, str], dict[str, tuple[int, int]]]:
+    """Scan brain_dir for swarm coordinators and return (worker_to_coord, coord_activity)."""
+    root = Path(brain_dir) if brain_dir is not None else get_brain_dir()
+    worker_to_coord: dict[str, str] = {}
+    coord_activity: dict[str, tuple[int, int]] = {}
+    if not root.exists():
+        return worker_to_coord, coord_activity
+
+    for members_path in root.glob("*/.system_generated/swarm/members.json"):
+        swarm_dir = members_path.parent
+        coord_cid = swarm_dir.parent.parent.name
+        members_data = _read_json_file(members_path)
+        max_mtime_ns, total_size = _stat_swarm_files(swarm_dir)
+        members_raw = members_data.get("members")
+        if isinstance(members_raw, dict):
+            for name, m in members_raw.items():
+                if not isinstance(m, dict):
+                    continue
+                w_cid = str(m.get("conversation_id") or "").strip()
+                if name == "coordinator" or not w_cid or w_cid == coord_cid:
+                    continue
+                if not _is_safe_member_conv_id(w_cid):
+                    continue
+                worker_to_coord[w_cid] = coord_cid
+                w_tp = root / w_cid / ".system_generated" / "logs" / "transcript.jsonl"
+                try:
+                    st = w_tp.stat()
+                    max_mtime_ns = max(max_mtime_ns, st.st_mtime_ns)
+                    total_size += st.st_size
+                except OSError:
+                    pass
+        coord_activity[coord_cid] = (max_mtime_ns, total_size)
+
+    return worker_to_coord, coord_activity
 
 
 def parse_transcript(
@@ -643,6 +895,14 @@ def parse_transcript(
         if resolved:
             display_title = resolved
 
+    conv_dir = _resolve_conv_dir(p)
+    is_swarm = False
+    swarm_info: dict[str, Any] | None = None
+    swarm_max_mtime_ns = 0
+    if conv_dir is not None:
+        is_swarm, swarm_info, swarm_max_mtime_ns, _ = _parse_swarm_info(conv_dir, conv_id)
+    eff_mtime_ns = max(stat.st_mtime_ns, swarm_max_mtime_ns)
+
     return {
         "conversationId": conv_id,
         "title": display_title,
@@ -653,6 +913,8 @@ def parse_transcript(
         "latest": latest,
         "deltaTokens": delta_tokens,
         "isOrchestrator": is_orchestrator,
+        "isSwarm": is_swarm,
+        "swarm": swarm_info,
         "modelCaches": model_caches,
         "freshnessTarget": freshness_target,
         "justCompacted": just_compacted,
@@ -673,8 +935,8 @@ def parse_transcript(
             "output": total_output,
         },
         "history": invocations[-40:],
-        "mtimeNs": stat.st_mtime_ns,
-        "mtimeMs": int(stat.st_mtime * 1000),
+        "mtimeNs": eff_mtime_ns,
+        "mtimeMs": int(eff_mtime_ns // 1_000_000),
     }
 
 
@@ -718,18 +980,26 @@ def list_sessions(
         return []
 
     now = now_ts if now_ts is not None else time.time()
+    worker_to_coord, coord_activity = scan_swarm_map(root)
     candidates: list[tuple[int, int, Path]] = []
     for p in root.glob("*/.system_generated/logs/transcript.jsonl"):
+        cid = _extract_conversation_id(p)
+        if cid in worker_to_coord:
+            continue
         try:
             st = p.stat()
         except OSError:
             continue
-        candidates.append((st.st_mtime_ns, st.st_size, p))
+        s_mtime_ns, s_size = coord_activity.get(cid, (0, 0))
+        eff_mtime_ns = max(st.st_mtime_ns, s_mtime_ns)
+        eff_size = st.st_size + s_size
+        candidates.append((eff_mtime_ns, eff_size, p))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     candidates = candidates[:limit]
 
-    active_conv_id = (active_info or {}).get("conversationId")
+    raw_active_cid = (active_info or {}).get("conversationId")
+    active_conv_id = worker_to_coord.get(raw_active_cid, raw_active_cid) if raw_active_cid else None
     sessions: list[dict[str, Any]] = []
 
     for idx, (mtime_ns, size, p) in enumerate(candidates):
@@ -751,6 +1021,8 @@ def list_sessions(
         else:
             item = parsed
 
+        item["mtimeNs"] = mtime_ns
+        item["mtimeMs"] = int(mtime_ns // 1_000_000)
         item["isActive"] = bool(active_conv_id and item["conversationId"] == active_conv_id)
         item["isMostRecent"] = idx == 0
         sessions.append(item)

@@ -646,7 +646,12 @@ class ContextMonitorTests(unittest.TestCase):
             self.assertTrue(sc_test["webhook"]["sent"])
             self.assertGreaterEqual(len(_WebhookRecorderHandler.received), 1)
         finally:
-            proc.stdin.close()
+            if proc.stdin:
+                proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
             proc.terminate()
             proc.wait(timeout=5)
             srv.shutdown()
@@ -785,6 +790,369 @@ class ContextMonitorTests(unittest.TestCase):
             kwargs = mock_popen.call_args.kwargs
             self.assertNotIn("start_new_session", kwargs)
             self.assertEqual(kwargs["creationflags"], 0x08000008)
+
+    def test_swarm_coordinator_parsing_and_worker_aggregation(self) -> None:
+        coord_cid = "c0000000-0000-0000-0000-000000000001"
+        w_impl_cid = "w1111111-0000-0000-0000-000000000002"
+        w_adv_cid = "w2222222-0000-0000-0000-000000000003"
+        w_dead_cid = "w3333333-0000-0000-0000-000000000004"
+        plain_cid = "p4444444-0000-0000-0000-000000000005"
+
+        coord_tp = self.brain_dir / coord_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        _write_fixture_transcript(
+            coord_tp,
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": _iso_ago(200), "content": "/swarm task"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(180),
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": 20000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 500,
+                    "tool_calls": [{"name": "swarm"}],
+                },
+            ],
+        )
+
+        # Working worker (last model invocation called run_command)
+        _write_fixture_transcript(
+            self.brain_dir / w_impl_cid / ".system_generated" / "logs" / "transcript.jsonl",
+            [
+                {"step_index": 0, "type": "SYSTEM_MESSAGE", "created_at": _iso_ago(170), "content": "brief"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(160),
+                    "model": "gemini-4-hydrogen-xhigh",
+                    "input_tokens": 12000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 300,
+                    "tool_calls": [{"name": "read_file"}],
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(30),
+                    "model": "gemini-4-hydrogen-xhigh",
+                    "input_tokens": 3000,
+                    "cache_read_tokens": 12000,
+                    "output_tokens": 200,
+                    "tool_calls": [{"name": "run_command"}],
+                },
+            ],
+        )
+
+        # Waiting worker (parked on swarm_wait)
+        _write_fixture_transcript(
+            self.brain_dir / w_adv_cid / ".system_generated" / "logs" / "transcript.jsonl",
+            [
+                {
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(100),
+                    "model": "gemini-4-carbon-high",
+                    "input_tokens": 15000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 400,
+                    "tool_calls": [{"name": "swarm_wait"}],
+                },
+                {"step_index": 1, "type": "GENERIC", "created_at": _iso_ago(99), "content": "Waiting"},
+            ],
+        )
+
+        # Killed worker
+        _write_fixture_transcript(
+            self.brain_dir / w_dead_cid / ".system_generated" / "logs" / "transcript.jsonl",
+            [
+                {
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(150),
+                    "model": "gemini-3.8-flash-high",
+                    "input_tokens": 5000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100,
+                    "tool_calls": [{"name": "read_file"}],
+                }
+            ],
+        )
+
+        swarm_dir = self.brain_dir / coord_cid / ".system_generated" / "swarm"
+        swarm_dir.mkdir(parents=True, exist_ok=True)
+        (swarm_dir / "swarm.json").write_text(
+            json.dumps({"version": 1, "backend": "local", "swarm_id": coord_cid}),
+            encoding="utf-8",
+        )
+        (swarm_dir / "members.json").write_text(
+            json.dumps(
+                {
+                    "title": "",
+                    "members": {
+                        "coordinator": {
+                            "conversation_id": coord_cid,
+                            "role": "coordinator",
+                            "model": "gemini-4-neon-high",
+                            "killed": False,
+                        },
+                        "implementer": {
+                            "conversation_id": w_impl_cid,
+                            "role": "worker",
+                            "desired_model": "gemini-4-hydrogen-xhigh",
+                            "applied_model": "gemini-4-hydrogen-xhigh",
+                            "wake_mode": "working",
+                            "killed": False,
+                        },
+                        "advisor": {
+                            "conversation_id": w_adv_cid,
+                            "role": "worker",
+                            "model": "gemini-4-carbon-high",
+                            "wake_mode": "mentions",
+                            "killed": False,
+                        },
+                        "old-helper": {
+                            "conversation_id": w_dead_cid,
+                            "role": "worker",
+                            "model": "gemini-3.8-flash-high",
+                            "killed": True,
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (swarm_dir / "plan.json").write_text(
+            json.dumps({"goal": {"title": "Minimal Swarm Prototype", "line": "Test plan fallback"}}),
+            encoding="utf-8",
+        )
+        (swarm_dir / "board.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"seq": 1, "agent": "coordinator", "text": "@implementer go"}),
+                    json.dumps({"seq": 2, "agent": "implementer", "text": "@advisor ready"}),
+                    '{"seq": 3, "broken": ',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        parsed = transcript_parser.parse_transcript(coord_tp)
+        self.assertTrue(parsed["isSwarm"])
+        swarm = parsed["swarm"]
+        self.assertIsNotNone(swarm)
+        self.assertEqual(swarm["title"], "Minimal Swarm Prototype")
+        self.assertEqual(swarm["workerCount"], 3)
+        self.assertEqual(swarm["workingCount"], 1)
+        self.assertEqual(swarm["boardMessages"], 2)
+
+        # Coordinator tokens (20k) must NOT be double-counted into worker totals
+        self.assertEqual(
+            swarm["totals"],
+            {
+                "calls": 4,
+                "uncachedInput": 35000,
+                "cacheRead": 12000,
+                "output": 1000,
+            },
+        )
+        by_name = {w["name"]: w for w in swarm["workers"]}
+        self.assertNotIn("coordinator", by_name)
+        self.assertEqual(by_name["implementer"]["status"], "working")
+        self.assertEqual(by_name["implementer"]["contextTokens"], 15000)
+        self.assertEqual(by_name["implementer"]["calls"], 2)
+        self.assertEqual(by_name["advisor"]["status"], "waiting")
+        self.assertEqual(by_name["old-helper"]["status"], "killed")
+
+        # Non-swarm transcript reports isSwarm=False and swarm=None
+        plain_tp = self.brain_dir / plain_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        _write_fixture_transcript(
+            plain_tp,
+            [{"step_index": 0, "type": "USER_INPUT", "created_at": _iso_ago(10), "content": "Normal"}],
+        )
+        plain_parsed = transcript_parser.parse_transcript(plain_tp)
+        self.assertFalse(plain_parsed["isSwarm"])
+        self.assertIsNone(plain_parsed["swarm"])
+
+    def test_swarm_list_sessions_filtering_active_remap_and_live_refresh(self) -> None:
+        coord_cid = "c1111111-0000-0000-0000-000000000001"
+        worker_cid = "w2222222-0000-0000-0000-000000000002"
+        other_cid = "o3333333-0000-0000-0000-000000000003"
+
+        coord_tp = self.brain_dir / coord_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        worker_tp = self.brain_dir / worker_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        other_tp = self.brain_dir / other_cid / ".system_generated" / "logs" / "transcript.jsonl"
+
+        _write_fixture_transcript(
+            coord_tp,
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": _iso_ago(300), "content": "/swarm run"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(290),
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": 18000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 300,
+                    "tool_calls": [{"name": "swarm"}],
+                },
+            ],
+        )
+        _write_fixture_transcript(
+            worker_tp,
+            [
+                {
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(120),
+                    "model": "gemini-4-hydrogen-xhigh",
+                    "input_tokens": 10000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 200,
+                    "tool_calls": [{"name": "read_file"}],
+                }
+            ],
+        )
+        _write_fixture_transcript(
+            other_tp,
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": _iso_ago(200), "content": "Other session"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(190),
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": 9000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 100,
+                    "tool_calls": [],
+                },
+            ],
+        )
+
+        swarm_dir = self.brain_dir / coord_cid / ".system_generated" / "swarm"
+        swarm_dir.mkdir(parents=True, exist_ok=True)
+        (swarm_dir / "members.json").write_text(
+            json.dumps(
+                {
+                    "title": "Demo Swarm",
+                    "members": {
+                        "coordinator": {"conversation_id": coord_cid, "role": "coordinator"},
+                        "implementer": {
+                            "conversation_id": worker_cid,
+                            "role": "worker",
+                            "model": "gemini-4-hydrogen-xhigh",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (swarm_dir / "board.jsonl").write_text(
+            json.dumps({"seq": 1, "agent": "coordinator", "text": "@implementer start"}) + "\n",
+            encoding="utf-8",
+        )
+
+        # Preserve older mtime on coordinator transcript to verify swarm/worker mtime keeps coordinator fresh
+        old_ns = int((datetime.now(timezone.utc) - timedelta(seconds=250)).timestamp() * 1e9)
+        os.utime(coord_tp, ns=(old_ns, old_ns))
+        mid_ns = int((datetime.now(timezone.utc) - timedelta(seconds=150)).timestamp() * 1e9)
+        os.utime(other_tp, ns=(mid_ns, mid_ns))
+
+        cache: dict = {}
+        sessions1 = transcript_parser.list_sessions(brain_dir=self.brain_dir, cache=cache)
+        cids1 = [s["conversationId"] for s in sessions1]
+        self.assertEqual(cids1, [coord_cid, other_cid])
+        self.assertNotIn(worker_cid, cids1)
+        self.assertTrue(sessions1[0]["isSwarm"])
+        self.assertEqual(sessions1[0]["swarm"]["totals"]["calls"], 1)
+
+        # Update worker transcript WITHOUT touching coordinator transcript -> cache invalidates and refreshes
+        _write_fixture_transcript(
+            worker_tp,
+            [
+                {
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(120),
+                    "model": "gemini-4-hydrogen-xhigh",
+                    "input_tokens": 10000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 200,
+                    "tool_calls": [{"name": "read_file"}],
+                },
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(5),
+                    "model": "gemini-4-hydrogen-xhigh",
+                    "input_tokens": 2000,
+                    "cache_read_tokens": 10000,
+                    "output_tokens": 150,
+                    "tool_calls": [],
+                },
+            ],
+        )
+        sessions2 = transcript_parser.list_sessions(brain_dir=self.brain_dir, cache=cache)
+        self.assertEqual(sessions2[0]["swarm"]["totals"]["calls"], 2)
+        self.assertEqual(sessions2[0]["swarm"]["workers"][0]["status"], "waiting")
+
+        # MCP snapshot remaps worker active-session.json back to coordinator and omits worker from sessions
+        transcript_parser.save_active_session(
+            self.data_dir,
+            {
+                "conversationId": worker_cid,
+                "transcriptPath": str(worker_tp),
+                "updatedAt": int(datetime.now(timezone.utc).timestamp()),
+            },
+        )
+        env = dict(os.environ)
+        env["ANTIGRAVITY_BRAIN_DIR"] = str(self.brain_dir)
+        env["CONTEXT_MONITOR_DISABLE_WATCHER"] = "1"
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPTS_DIR / "mcp_server.py"), "--data-dir", str(self.data_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        try:
+            proc.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "app_get_context_snapshot", "arguments": {}},
+                    }
+                )
+                + "\n"
+            )
+            proc.stdin.flush()
+            snap_resp = json.loads(proc.stdout.readline())
+        finally:
+            if proc.stdin:
+                proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+            proc.terminate()
+            proc.wait(timeout=5)
+
+        res = snap_resp["result"]
+        sc = res["structuredContent"]
+        self.assertEqual(sc["activeConversationId"], coord_cid)
+        self.assertEqual(sc["selectedConversationId"], coord_cid)
+        self.assertEqual([s["conversationId"] for s in sc["sessions"]], [coord_cid, other_cid])
+        self.assertTrue(sc["sessions"][0]["isSwarm"])
+        self.assertEqual(sc["sessions"][0]["swarmWorkers"], 1)
+        self.assertIn("[Swarm]", res["content"][0]["text"])
+        self.assertEqual(sc["selected"]["swarm"]["totals"]["calls"], 2)
 
 
 if __name__ == "__main__":

@@ -68,10 +68,38 @@ interface SessionSummary {
   userTurns: number;
   modelCalls: number;
   isOrchestrator?: boolean;
+  isSwarm?: boolean;
+  swarmWorkers?: number;
   justCompacted?: boolean;
   isActive: boolean;
   isMostRecent: boolean;
   mtimeMs: number;
+}
+
+interface SwarmWorkerInfo {
+  name: string;
+  role: string;
+  model: string;
+  status: string;
+  calls: number;
+  contextTokens: number;
+  uncachedInput: number;
+  cacheRead: number;
+  output: number;
+}
+
+interface SwarmSummary {
+  title: string;
+  workerCount: number;
+  workingCount: number;
+  boardMessages: number;
+  totals: {
+    calls: number;
+    uncachedInput: number;
+    cacheRead: number;
+    output: number;
+  };
+  workers: SwarmWorkerInfo[];
 }
 
 interface SessionDetail extends SessionSummary {
@@ -79,6 +107,7 @@ interface SessionDetail extends SessionSummary {
   latest: InvocationMetric | null;
   modelCaches?: ModelCacheEntry[];
   freshnessTarget?: FreshnessTarget | null;
+  swarm?: SwarmSummary | null;
   compactionCount?: number;
   lastCompaction?: LastCompactionInfo | null;
   totals: {
@@ -241,7 +270,7 @@ function updateSessionSelect(): void {
   if (document.activeElement === sessionSelectEl) return;
 
   const sessions = snapshot.sessions ?? [];
-  const sig = `${selectedMode}|` + sessions.map((s) => `${s.conversationId}:${s.title}:${s.contextTokens}:${Boolean(s.justCompacted)}:${s.isActive}`).join(',');
+  const sig = `${selectedMode}|` + sessions.map((s) => `${s.conversationId}:${s.title}:${s.contextTokens}:${Boolean(s.justCompacted)}:${Boolean(s.isSwarm)}:${s.swarmWorkers ?? 0}:${s.isActive}`).join(',');
   if (sig === lastSessionsSignature) return;
   lastSessionsSignature = sig;
 
@@ -249,9 +278,10 @@ function updateSessionSelect(): void {
     `<option value="auto" ${selectedMode === 'auto' ? 'selected' : ''}>自動追従 (アクティブ / 最新)</option>`,
     ...sessions.map((s) => {
       const tag = s.isActive ? '● ' : '';
+      const swarm = s.isSwarm ? '🐝 ' : '';
       const orch = s.isOrchestrator ? '⚡' : '';
       const ctxLabel = s.justCompacted ? `(${fmtK(s.contextTokens)} 要約済)` : `(${fmtK(s.contextTokens)})`;
-      const label = `${tag}${orch}${s.title} ${ctxLabel}`;
+      const label = `${tag}${swarm}${orch}${s.title} ${ctxLabel}`;
       const isSel = selectedMode === s.conversationId;
       return `<option value="${esc(s.conversationId)}" ${isSel ? 'selected' : ''}>${esc(label)}</option>`;
     }),
@@ -450,6 +480,47 @@ function updateLiveFreshnessDom(): void {
   });
 }
 
+function renderSwarmCard(swarm: SwarmSummary): string {
+  const rows = swarm.workers
+    .map((w) => {
+      const isEnded = w.status === 'killed' || w.status === 'stopped';
+      const statusPill =
+        w.status === 'working'
+          ? `<span class="pill pill-info">実行中</span>`
+          : w.status === 'waiting'
+            ? `<span class="pill pill-neutral">待機中</span>`
+            : `<span class="pill pill-neutral">終了</span>`;
+      return `<div class="orch-item${isEnded ? ' orch-item-stale' : ''}">
+        <div class="orch-top">
+          <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
+            <span class="orch-model">@${esc(w.name)}</span>
+            <span class="pill pill-neutral">${esc(w.model)}</span>
+          </div>
+          ${statusPill}
+        </div>
+        <div class="orch-meta">
+          <span>Context: <strong>${esc(fmtK(w.contextTokens))}</strong> · New ${esc(fmtK(w.uncachedInput))}</span>
+          <span>${w.calls} calls</span>
+        </div>
+      </div>`;
+    })
+    .join('');
+
+  return `<div class="card">
+    <div class="card-header">
+      <span class="card-label">Swarm${swarm.title ? ` · ${esc(swarm.title)}` : ''}</span>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        <span class="pill ${swarm.workingCount > 0 ? 'pill-info' : 'pill-neutral'}">${swarm.workingCount}/${swarm.workerCount} active</span>
+        <span class="pill pill-neutral">${swarm.boardMessages} msgs</span>
+      </div>
+    </div>
+    <div class="orch-meta">
+      <span>Workers合計: <strong>${swarm.totals.calls}</strong> calls · New <strong>${esc(fmtK(swarm.totals.uncachedInput))}</strong> · Cache <strong>${esc(fmtK(swarm.totals.cacheRead))}</strong> · Out <strong>${esc(fmtK(swarm.totals.output))}</strong></span>
+    </div>
+    ${rows ? `<div class="orch-list">${rows}</div>` : `<div class="status-note">ワーカー未追加</div>`}
+  </div>`;
+}
+
 function renderMonitorBody(): void {
   if (!monitorBodyEl) return;
   const settings = snapshot?.settings ?? DEFAULT_SETTINGS;
@@ -472,6 +543,7 @@ function renderMonitorBody(): void {
   const modelLabel = selected.model || latest?.model || '';
   const caches = selected.modelCaches ?? [];
   const orchHtml = selected.isOrchestrator && caches.length >= 2 ? renderOrchestratorCard(caches, settings) : '';
+  const swarmHtml = selected.isSwarm && selected.swarm ? renderSwarmCard(selected.swarm) : '';
 
   let contextCardHtml = '';
   let freshnessCardHtml = '';
@@ -492,6 +564,7 @@ function renderMonitorBody(): void {
         <div class="card-header">
           <span class="card-label">Context Usage</span>
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            ${selected.isSwarm ? `<span class="pill pill-info">Swarm</span>` : ''}
             ${selected.isOrchestrator ? `<span class="pill pill-info">Orchestrator</span>` : ''}
             ${modelLabel ? `<span class="pill pill-neutral">${esc(modelLabel)}</span>` : ''}
             <span class="pill pill-ok">Compact 完了</span>
@@ -571,6 +644,7 @@ function renderMonitorBody(): void {
         <div class="card-header">
           <span class="card-label">Context Usage</span>
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            ${selected.isSwarm ? `<span class="pill pill-info">Swarm</span>` : ''}
             ${selected.isOrchestrator ? `<span class="pill pill-info">Orchestrator</span>` : ''}
             <span class="pill pill-neutral">${esc(modelLabel || 'unknown')}</span>
             ${statusBadge}
@@ -624,6 +698,7 @@ function renderMonitorBody(): void {
       ${contextCardHtml}
       ${freshnessCardHtml}
       ${orchHtml}
+      ${swarmHtml}
 
       <div class="metrics-grid">
         <div class="metric-tile">
