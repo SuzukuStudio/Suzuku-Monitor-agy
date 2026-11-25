@@ -401,6 +401,8 @@ def maybe_notify_from_parsed(
     session_title = str(parsed.get("title") or "Untitled session")
     step_idx = int(latest.get("stepIndex") or 0)
     cache_pct = round(float(latest.get("cacheHitRate") or 0.0) * 100)
+    notify_cache = bool(settings.get("notifyOnCacheExpiry", True))
+    notify_ctx = bool(settings.get("notifyOnContextGrowth", True))
 
     chosen: dict[str, str] | None = None
 
@@ -409,10 +411,10 @@ def maybe_notify_from_parsed(
         if step_idx <= last_step:
             return None
 
-        if ctx < int(warn_tokens * 0.8):
+        if notify_ctx and ctx < int(warn_tokens * 0.8):
             conv_state["warnNotified"] = False
 
-        if latest.get("cacheMiss"):
+        if notify_cache and latest.get("cacheMiss"):
             chosen = {
                 "urgency": "critical",
                 "title": "🔥 Cache Miss 検知",
@@ -422,7 +424,7 @@ def maybe_notify_from_parsed(
                 ),
                 "kind": "cache_miss",
             }
-        elif ctx >= danger_tokens:
+        elif notify_ctx and ctx >= danger_tokens:
             last_danger_ts = float(conv_state.get("lastDangerTs") or 0)
             last_danger_ctx = int(conv_state.get("lastDangerCtx") or 0)
             if (now - last_danger_ts) >= 180 or (ctx - last_danger_ctx) >= 25_000:
@@ -437,7 +439,7 @@ def maybe_notify_from_parsed(
                 }
                 conv_state["lastDangerTs"] = now
                 conv_state["lastDangerCtx"] = ctx
-        elif ctx >= warn_tokens and not conv_state.get("warnNotified"):
+        elif notify_ctx and ctx >= warn_tokens and not conv_state.get("warnNotified"):
             chosen = {
                 "urgency": "normal",
                 "title": "🟡 コンテキスト注意",
@@ -472,7 +474,12 @@ def maybe_notify_from_parsed(
         stale_limit = get_model_context_limit(stale_model)
         stale_pct = (stale_ctx / stale_limit * 100.0) if stale_limit > 0 else pct_limit
         last_stale_ts = float(conv_state.get("lastStaleTs") or 0)
-        if idle_sec >= cache_ttl and stale_ctx >= int(warn_tokens * 0.6) and (now - last_stale_ts) >= 120:
+        if (
+            notify_cache
+            and idle_sec >= cache_ttl
+            and stale_ctx >= int(warn_tokens * 0.6)
+            and (now - last_stale_ts) >= 120
+        ):
             chosen = {
                 "urgency": "normal",
                 "title": "⏱️ キャッシュ期限超過の可能性",
@@ -519,7 +526,7 @@ def maybe_notify_pre_expiry(
     """Notify once per model/step when an Orchestrator or single model nears cache TTL expiry."""
     if parsed.get("justCompacted"):
         return []
-    if not settings.get("notifyBeforeExpiry", True):
+    if not (settings.get("notifyOnCacheExpiry", True) and settings.get("notifyBeforeExpiry", True)):
         return []
     has_channel = bool(settings.get("desktopNotifyEnabled", True) or settings.get("remoteWebhookUrl"))
     if not has_channel:

@@ -124,6 +124,8 @@ interface MonitorSettings {
   cacheTtlSec: number;
   pollIntervalMs: number;
   desktopNotifyEnabled: boolean;
+  notifyOnCacheExpiry: boolean;
+  notifyOnContextGrowth: boolean;
   notifyOnTurnEnd: boolean;
   notifyBeforeExpiry: boolean;
   remoteWebhookUrl: string;
@@ -146,6 +148,8 @@ const DEFAULT_SETTINGS: MonitorSettings = {
   cacheTtlSec: 300,
   pollIntervalMs: 2000,
   desktopNotifyEnabled: true,
+  notifyOnCacheExpiry: true,
+  notifyOnContextGrowth: true,
   notifyOnTurnEnd: false,
   notifyBeforeExpiry: true,
   remoteWebhookUrl: '',
@@ -757,8 +761,16 @@ function renderSettings(): void {
                 デスクトップ通知を有効にする (Linux / macOS / Windows)
               </label>
               <label class="checkbox-row">
+                <input id="set-notify-cache" type="checkbox" ${settings.notifyOnCacheExpiry ? 'checked' : ''} />
+                キャッシュ切れ・Cache Miss 検知時に通知する
+              </label>
+              <label class="checkbox-row">
                 <input id="set-pre-expiry" type="checkbox" ${settings.notifyBeforeExpiry ? 'checked' : ''} />
-                キャッシュ切れ約1分前に事前アラートを出す (Orchestrator 各モデル対応)
+                キャッシュ切れ約1分前に事前アラートを出す (上記が有効時・Orchestrator 各モデル対応)
+              </label>
+              <label class="checkbox-row">
+                <input id="set-notify-ctx" type="checkbox" ${settings.notifyOnContextGrowth ? 'checked' : ''} />
+                コンテキスト肥大・注意しきい値到達時に通知する
               </label>
               <label class="checkbox-row">
                 <input id="set-turn-end" type="checkbox" ${settings.notifyOnTurnEnd ? 'checked' : ''} />
@@ -853,7 +865,9 @@ function bindSettingsEvents(): void {
 async function saveCurrentFormSettings(successText: string): Promise<void> {
   const desktopEl = document.getElementById('set-desktop') as HTMLInputElement | null;
   if (!desktopEl) return;
+  const notifyCacheEl = document.getElementById('set-notify-cache') as HTMLInputElement;
   const preExpiryEl = document.getElementById('set-pre-expiry') as HTMLInputElement;
+  const notifyCtxEl = document.getElementById('set-notify-ctx') as HTMLInputElement;
   const turnEndEl = document.getElementById('set-turn-end') as HTMLInputElement;
   const webhookUrlEl = document.getElementById('set-webhook-url') as HTMLInputElement;
   const webhookTokenEl = document.getElementById('set-webhook-token') as HTMLInputElement;
@@ -868,7 +882,9 @@ async function saveCurrentFormSettings(successText: string): Promise<void> {
       'app_update_settings',
       {
         desktopNotifyEnabled: desktopEl.checked,
+        notifyOnCacheExpiry: notifyCacheEl.checked,
         notifyBeforeExpiry: preExpiryEl.checked,
+        notifyOnContextGrowth: notifyCtxEl.checked,
         notifyOnTurnEnd: turnEndEl.checked,
         remoteWebhookUrl: webhookUrlEl.value.trim(),
         remoteWebhookToken: webhookTokenEl.value.trim(),

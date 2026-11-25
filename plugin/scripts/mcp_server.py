@@ -56,7 +56,7 @@ class ContextMonitorServer:
         while not self._stop_event.wait(15.0):
             try:
                 settings = load_settings(self.data_dir)
-                if not settings.get("notifyBeforeExpiry", True):
+                if not (settings.get("notifyOnCacheExpiry", True) and settings.get("notifyBeforeExpiry", True)):
                     continue
                 if not (settings.get("desktopNotifyEnabled", True) or settings.get("remoteWebhookUrl")):
                     continue
@@ -395,6 +395,8 @@ class ContextMonitorServer:
                                 "cacheTtlSec": {"type": "integer"},
                                 "pollIntervalMs": {"type": "integer"},
                                 "desktopNotifyEnabled": {"type": "boolean"},
+                                "notifyOnCacheExpiry": {"type": "boolean"},
+                                "notifyOnContextGrowth": {"type": "boolean"},
                                 "notifyOnTurnEnd": {"type": "boolean"},
                                 "notifyBeforeExpiry": {"type": "boolean"},
                                 "remoteWebhookUrl": {"type": "string"},

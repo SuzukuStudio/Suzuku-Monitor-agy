@@ -67,9 +67,13 @@ def _maybe_chat_warning(
     stale_ctx = int((ft.get("contextTokens") if ft else ctx) or 0)
     stale_model = str((ft.get("model") if ft else latest.get("model")) or "unknown")
     cache_miss = bool(latest.get("cacheMiss"))
+    notify_cache = bool(settings.get("notifyOnCacheExpiry", True))
+    notify_ctx = bool(settings.get("notifyOnContextGrowth", True))
 
-    is_stale = idle_sec >= cache_ttl and stale_ctx >= int(warn_tokens * 0.6)
-    is_danger = ctx >= danger_tokens or cache_miss
+    is_stale = notify_cache and idle_sec >= cache_ttl and stale_ctx >= int(warn_tokens * 0.6)
+    is_cache_miss = notify_cache and cache_miss
+    is_ctx_danger = notify_ctx and ctx >= danger_tokens
+    is_danger = is_ctx_danger or is_cache_miss
     if not (is_stale or is_danger):
         return {}
 
@@ -83,7 +87,7 @@ def _maybe_chat_warning(
     if prev.get("lastChatWarnStep") == step_idx and (now - int(prev.get("lastChatWarnTs") or 0)) < 120:
         return {}
 
-    reason = "Cache Miss" if cache_miss else ("TTL超過" if is_stale else "肥大化")
+    reason = "Cache Miss" if is_cache_miss else ("TTL超過" if is_stale else "肥大化")
     shown_ctx = stale_ctx if (is_stale and not is_danger) else ctx
     shown_model = stale_model if (is_stale and not is_danger) else (latest.get("model") or "unknown")
     msg = (

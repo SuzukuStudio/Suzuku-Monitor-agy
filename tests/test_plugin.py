@@ -21,6 +21,7 @@ PLUGIN_DIR = ROOT / "plugin"
 SCRIPTS_DIR = PLUGIN_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import context_hook  # noqa: E402
 import notifier  # noqa: E402
 import transcript_parser  # noqa: E402
 
@@ -1153,6 +1154,333 @@ class ContextMonitorTests(unittest.TestCase):
         self.assertEqual(sc["sessions"][0]["swarmWorkers"], 1)
         self.assertIn("[Swarm]", res["content"][0]["text"])
         self.assertEqual(sc["selected"]["swarm"]["totals"]["calls"], 2)
+
+    def test_independent_cache_and_context_notification_gates(self) -> None:
+        base_settings = {
+            "desktopNotifyEnabled": False,
+            "remoteWebhookUrl": "http://127.0.0.1:9/unused",
+            "warnTokens": 80000,
+            "dangerTokens": 150000,
+            "cacheTtlSec": 300,
+            "notifyBeforeExpiry": True,
+            "notifyOnTurnEnd": True,
+            "chatWarningOnDanger": True,
+        }
+
+        def make_parsed(
+            *,
+            cid: str,
+            ctx: int,
+            cache_miss: bool,
+            idle_sec: int,
+            step_idx: int,
+            is_swarm: bool,
+            has_tool_calls: bool = False,
+        ) -> dict:
+            return {
+                "conversationId": cid,
+                "title": "Gate Test",
+                "model": "gemini-4-neon-high",
+                "contextLimit": 512000,
+                "idleSeconds": idle_sec,
+                "justCompacted": False,
+                "isSwarm": is_swarm,
+                "latest": {
+                    "stepIndex": step_idx,
+                    "model": "gemini-4-neon-high",
+                    "contextTokens": ctx,
+                    "cacheHitRate": 0.0 if cache_miss else 0.9,
+                    "cacheMiss": cache_miss,
+                    "hasToolCalls": has_tool_calls,
+                },
+                "modelCaches": [
+                    {
+                        "model": "gemini-4-neon-high",
+                        "role": "primary",
+                        "contextTokens": ctx,
+                        "idleSeconds": idle_sec,
+                        "stepIndex": step_idx,
+                        "staleAfterCompact": False,
+                    }
+                ],
+            }
+
+        with mock.patch.object(notifier, "dispatch_notification"):
+            # 1 & 3. notifyOnCacheExpiry=False, notifyOnContextGrowth=True (identical for isSwarm=False and True)
+            s_ctx_only = transcript_parser.normalize_settings(
+                {**base_settings, "notifyOnCacheExpiry": False, "notifyOnContextGrowth": True}
+            )
+            for is_swarm in (False, True):
+                sub_dir = self.data_dir / f"ctx_only_{is_swarm}"
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                cid = f"conv-ctx-only-{is_swarm}"
+
+                # cache_miss + below warn -> suppressed; falls through to turn_end
+                p_miss_low = make_parsed(
+                    cid=cid, ctx=50000, cache_miss=True, idle_sec=350, step_idx=1, is_swarm=is_swarm
+                )
+                res_low = notifier.maybe_notify_from_parsed(
+                    sub_dir, p_miss_low, s_ctx_only, "PostInvocation", now_ts=1000
+                )
+                self.assertIsNotNone(res_low)
+                self.assertEqual(res_low["kind"], "turn_end")
+
+                # stale_pre and pre_expiry must be suppressed even when notifyBeforeExpiry=True
+                self.assertIsNone(
+                    notifier.maybe_notify_from_parsed(
+                        sub_dir,
+                        make_parsed(cid=cid, ctx=90000, cache_miss=False, idle_sec=350, step_idx=1, is_swarm=is_swarm),
+                        s_ctx_only,
+                        "PreInvocation",
+                        invocation_num=0,
+                        now_ts=1010,
+                    )
+                )
+                self.assertEqual(
+                    notifier.maybe_notify_pre_expiry(
+                        sub_dir,
+                        make_parsed(cid=cid, ctx=90000, cache_miss=False, idle_sec=260, step_idx=1, is_swarm=is_swarm),
+                        s_ctx_only,
+                        now_ts=1010,
+                    ),
+                    [],
+                )
+
+                # cache_miss + warn -> falls through and fires warn
+                res_warn = notifier.maybe_notify_from_parsed(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=90000, cache_miss=True, idle_sec=10, step_idx=2, is_swarm=is_swarm),
+                    s_ctx_only,
+                    "PostInvocation",
+                    now_ts=1020,
+                )
+                self.assertIsNotNone(res_warn)
+                self.assertEqual(res_warn["kind"], "warn")
+
+                # cache_miss + danger -> falls through and fires danger
+                res_danger = notifier.maybe_notify_from_parsed(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=160000, cache_miss=True, idle_sec=10, step_idx=3, is_swarm=is_swarm),
+                    s_ctx_only,
+                    "PostInvocation",
+                    now_ts=1030,
+                )
+                self.assertIsNotNone(res_danger)
+                self.assertEqual(res_danger["kind"], "danger")
+
+                # _maybe_chat_warning: stale/miss below danger suppressed; >= danger emits 肥大化
+                self.assertEqual(
+                    context_hook._maybe_chat_warning(sub_dir, p_miss_low, s_ctx_only, "PreInvocation", 0),
+                    {},
+                )
+                cw_danger = context_hook._maybe_chat_warning(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=160000, cache_miss=True, idle_sec=10, step_idx=3, is_swarm=is_swarm),
+                    s_ctx_only,
+                    "PreInvocation",
+                    0,
+                )
+                msg = cw_danger["injectSteps"][0]["systemMessage"]["systemMessage"]
+                self.assertIn("肥大化", msg)
+                self.assertNotIn("Cache Miss", msg)
+
+            # 2 & 3. notifyOnCacheExpiry=True, notifyOnContextGrowth=False (identical for isSwarm=False and True)
+            s_cache_only = transcript_parser.normalize_settings(
+                {**base_settings, "notifyOnCacheExpiry": True, "notifyOnContextGrowth": False}
+            )
+            for is_swarm in (False, True):
+                sub_dir = self.data_dir / f"cache_only_{is_swarm}"
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                cid = f"conv-cache-only-{is_swarm}"
+
+                # Seed notify-state with sentinel values to ensure warnNotified/lastDangerTs/lastDangerCtx are untouched
+                notifier._save_notify_state(
+                    sub_dir,
+                    {
+                        "conversations": {
+                            cid: {
+                                "lastNotifiedStep": 0,
+                                "warnNotified": True,
+                                "lastDangerTs": 123.0,
+                                "lastDangerCtx": 155000,
+                            }
+                        },
+                        "preExpiryNotified": {},
+                    },
+                )
+
+                # High context (>= danger) without cacheMiss suppresses danger/warn, falls through to turn_end
+                res_high = notifier.maybe_notify_from_parsed(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=180000, cache_miss=False, idle_sec=10, step_idx=1, is_swarm=is_swarm),
+                    s_cache_only,
+                    "PostInvocation",
+                    now_ts=2000,
+                )
+                self.assertIsNotNone(res_high)
+                self.assertEqual(res_high["kind"], "turn_end")
+
+                # Low context (< 0.8 * warnTokens) must NOT reset warnNotified while notifyOnContextGrowth=False
+                notifier.maybe_notify_from_parsed(
+                    sub_dir,
+                    make_parsed(
+                        cid=cid,
+                        ctx=20000,
+                        cache_miss=False,
+                        idle_sec=10,
+                        step_idx=2,
+                        is_swarm=is_swarm,
+                        has_tool_calls=True,
+                    ),
+                    s_cache_only,
+                    "PostInvocation",
+                    now_ts=2010,
+                )
+                saved_conv = notifier._load_notify_state(sub_dir)["conversations"][cid]
+                self.assertTrue(saved_conv["warnNotified"])
+                self.assertEqual(saved_conv["lastDangerTs"], 123.0)
+                self.assertEqual(saved_conv["lastDangerCtx"], 155000)
+
+                # cache_miss, stale_pre, and pre_expiry all still fire
+                res_miss = notifier.maybe_notify_from_parsed(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=180000, cache_miss=True, idle_sec=10, step_idx=3, is_swarm=is_swarm),
+                    s_cache_only,
+                    "PostInvocation",
+                    now_ts=2020,
+                )
+                self.assertIsNotNone(res_miss)
+                self.assertEqual(res_miss["kind"], "cache_miss")
+
+                res_stale = notifier.maybe_notify_from_parsed(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=90000, cache_miss=False, idle_sec=350, step_idx=3, is_swarm=is_swarm),
+                    s_cache_only,
+                    "PreInvocation",
+                    invocation_num=0,
+                    now_ts=2030,
+                )
+                self.assertIsNotNone(res_stale)
+                self.assertEqual(res_stale["kind"], "stale_pre")
+
+                res_pre = notifier.maybe_notify_pre_expiry(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=90000, cache_miss=False, idle_sec=260, step_idx=3, is_swarm=is_swarm),
+                    s_cache_only,
+                    now_ts=2040,
+                )
+                self.assertEqual(len(res_pre), 1)
+
+                # _maybe_chat_warning: >= danger without miss/stale is suppressed; cache_miss still fires
+                self.assertEqual(
+                    context_hook._maybe_chat_warning(
+                        sub_dir,
+                        make_parsed(cid=cid, ctx=180000, cache_miss=False, idle_sec=10, step_idx=4, is_swarm=is_swarm),
+                        s_cache_only,
+                        "PreInvocation",
+                        0,
+                    ),
+                    {},
+                )
+                cw_miss = context_hook._maybe_chat_warning(
+                    sub_dir,
+                    make_parsed(cid=cid, ctx=180000, cache_miss=True, idle_sec=10, step_idx=5, is_swarm=is_swarm),
+                    s_cache_only,
+                    "PreInvocation",
+                    0,
+                )
+                self.assertIn("Cache Miss", cw_miss["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+    def test_app_update_settings_round_trips_notification_flags(self) -> None:
+        env = dict(os.environ)
+        env["ANTIGRAVITY_BRAIN_DIR"] = str(self.brain_dir)
+        env["CONTEXT_MONITOR_DISABLE_WATCHER"] = "1"
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPTS_DIR / "mcp_server.py"), "--data-dir", str(self.data_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+
+        def rpc(msg: dict) -> dict:
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline())
+
+        try:
+            tools_list = rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            upd_schema = next(t for t in tools_list["result"]["tools"] if t["name"] == "app_update_settings")[
+                "inputSchema"
+            ]["properties"]
+            self.assertEqual(upd_schema["notifyOnCacheExpiry"]["type"], "boolean")
+            self.assertEqual(upd_schema["notifyOnContextGrowth"]["type"], "boolean")
+
+            # Defaults are True
+            snap0 = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "app_get_context_snapshot", "arguments": {}},
+                }
+            )["result"]["structuredContent"]
+            self.assertTrue(snap0["settings"]["notifyOnCacheExpiry"])
+            self.assertTrue(snap0["settings"]["notifyOnContextGrowth"])
+
+            # Toggle both False and verify persistence across snapshot calls
+            upd1 = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "app_update_settings",
+                        "arguments": {"notifyOnCacheExpiry": False, "notifyOnContextGrowth": False},
+                    },
+                }
+            )["result"]["structuredContent"]
+            self.assertFalse(upd1["settings"]["notifyOnCacheExpiry"])
+            self.assertFalse(upd1["settings"]["notifyOnContextGrowth"])
+
+            snap1 = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "app_get_context_snapshot", "arguments": {}},
+                }
+            )["result"]["structuredContent"]
+            self.assertFalse(snap1["settings"]["notifyOnCacheExpiry"])
+            self.assertFalse(snap1["settings"]["notifyOnContextGrowth"])
+            self.assertFalse(transcript_parser.load_settings(self.data_dir)["notifyOnCacheExpiry"])
+            self.assertFalse(transcript_parser.load_settings(self.data_dir)["notifyOnContextGrowth"])
+
+            # Toggle back to True / False mixed
+            upd2 = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "app_update_settings",
+                        "arguments": {"notifyOnCacheExpiry": True, "notifyOnContextGrowth": False},
+                    },
+                }
+            )["result"]["structuredContent"]
+            self.assertTrue(upd2["settings"]["notifyOnCacheExpiry"])
+            self.assertFalse(upd2["settings"]["notifyOnContextGrowth"])
+        finally:
+            if proc.stdin:
+                proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+            proc.terminate()
+            proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
