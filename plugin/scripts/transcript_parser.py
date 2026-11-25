@@ -566,9 +566,13 @@ def _parse_swarm_info(conv_dir: Path, conv_id: str) -> tuple[bool, dict[str, Any
             )
 
     working_count = sum(1 for w in workers if w["status"] == "working")
+    live_worker_count = sum(1 for w in workers if w["status"] not in ("killed", "stopped"))
+    retired_worker_count = len(workers) - live_worker_count
     swarm_info = {
         "title": swarm_title,
         "workerCount": len(workers),
+        "liveWorkerCount": live_worker_count,
+        "retiredWorkerCount": retired_worker_count,
         "workingCount": working_count,
         "boardMessages": board_messages,
         "totals": {

@@ -70,6 +70,7 @@ interface SessionSummary {
   isOrchestrator?: boolean;
   isSwarm?: boolean;
   swarmWorkers?: number;
+  swarmLiveWorkers?: number;
   justCompacted?: boolean;
   isActive: boolean;
   isMostRecent: boolean;
@@ -91,6 +92,8 @@ interface SwarmWorkerInfo {
 interface SwarmSummary {
   title: string;
   workerCount: number;
+  liveWorkerCount?: number;
+  retiredWorkerCount?: number;
   workingCount: number;
   boardMessages: number;
   totals: {
@@ -257,6 +260,17 @@ function renderShell(): void {
 
   document.getElementById('btn-refresh')?.addEventListener('click', () => {
     void refreshSnapshot();
+  });
+
+  monitorBodyEl.addEventListener('click', (ev) => {
+    const target = ev.target as HTMLElement | null;
+    const btn = target?.closest<HTMLButtonElement>('[data-swarm-retired-toggle]');
+    if (!btn) return;
+    const convId = btn.dataset.convId;
+    if (!convId) return;
+    const nextOpen = !(swarmRetiredOpenByConv.get(convId) ?? false);
+    swarmRetiredOpenByConv.set(convId, nextOpen);
+    renderMonitorBody();
   });
 }
 
@@ -484,44 +498,78 @@ function updateLiveFreshnessDom(): void {
   });
 }
 
-function renderSwarmCard(swarm: SwarmSummary): string {
-  const rows = swarm.workers
-    .map((w) => {
-      const isEnded = w.status === 'killed' || w.status === 'stopped';
-      const statusPill =
-        w.status === 'working'
-          ? `<span class="pill pill-info">実行中</span>`
-          : w.status === 'waiting'
-            ? `<span class="pill pill-neutral">待機中</span>`
-            : `<span class="pill pill-neutral">終了</span>`;
-      return `<div class="orch-item${isEnded ? ' orch-item-stale' : ''}">
-        <div class="orch-top">
-          <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
-            <span class="orch-model">@${esc(w.name)}</span>
-            <span class="pill pill-neutral">${esc(w.model)}</span>
-          </div>
-          ${statusPill}
-        </div>
-        <div class="orch-meta">
-          <span>Context: <strong>${esc(fmtK(w.contextTokens))}</strong> · New ${esc(fmtK(w.uncachedInput))}</span>
-          <span>${w.calls} calls</span>
-        </div>
-      </div>`;
-    })
-    .join('');
+const swarmRetiredOpenByConv = new Map<string, boolean>();
+
+function renderSwarmWorkerItem(w: SwarmWorkerInfo): string {
+  const isEnded = w.status === 'killed' || w.status === 'stopped';
+  const statusPill =
+    w.status === 'working'
+      ? `<span class="pill pill-info">実行中</span>`
+      : w.status === 'waiting'
+        ? `<span class="pill pill-neutral">待機中</span>`
+        : `<span class="pill pill-neutral">${w.status === 'stopped' ? '停止' : '終了'}</span>`;
+  return `<div class="orch-item${isEnded ? ' orch-item-stale' : ''}">
+    <div class="orch-top">
+      <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;">
+        <span class="orch-model">@${esc(w.name)}</span>
+        <span class="pill pill-neutral">${esc(w.model)}</span>
+      </div>
+      ${statusPill}
+    </div>
+    <div class="orch-meta">
+      <span>Context: <strong>${esc(fmtK(w.contextTokens))}</strong> · New ${esc(fmtK(w.uncachedInput))}</span>
+      <span>${w.calls} calls</span>
+    </div>
+  </div>`;
+}
+
+function renderSwarmCard(swarm: SwarmSummary, conversationId: string): string {
+  const isRetired = (w: SwarmWorkerInfo): boolean => w.status === 'killed' || w.status === 'stopped';
+  const statusRank = (s: string): number => (s === 'working' ? 0 : s === 'waiting' ? 1 : 2);
+  const liveWorkers = swarm.workers
+    .filter((w) => !isRetired(w))
+    .sort((a, b) => statusRank(a.status) - statusRank(b.status));
+  const retiredWorkers = swarm.workers.filter((w) => isRetired(w));
+  const liveCount = swarm.liveWorkerCount ?? liveWorkers.length;
+  const isRetiredOpen = swarmRetiredOpenByConv.get(conversationId) ?? false;
+
+  const liveSectionHtml =
+    liveWorkers.length > 0
+      ? `<div class="orch-list">${liveWorkers.map(renderSwarmWorkerItem).join('')}</div>`
+      : retiredWorkers.length > 0
+        ? `<div class="status-note">稼働中のワーカーはありません</div>`
+        : `<div class="status-note">ワーカー未追加</div>`;
+
+  const retiredSectionHtml =
+    retiredWorkers.length > 0
+      ? `<div class="swarm-retired-section">
+          <button
+            type="button"
+            class="swarm-retired-toggle"
+            data-swarm-retired-toggle="1"
+            data-conv-id="${esc(conversationId)}"
+            aria-expanded="${isRetiredOpen ? 'true' : 'false'}"
+          >
+            <span>終了済み (${retiredWorkers.length})</span>
+            <span class="status-note">${isRetiredOpen ? '▲ 閉じる' : '▼ 表示'}</span>
+          </button>
+          ${isRetiredOpen ? `<div class="orch-list">${retiredWorkers.map(renderSwarmWorkerItem).join('')}</div>` : ''}
+        </div>`
+      : '';
 
   return `<div class="card">
     <div class="card-header">
       <span class="card-label">Swarm${swarm.title ? ` · ${esc(swarm.title)}` : ''}</span>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-        <span class="pill ${swarm.workingCount > 0 ? 'pill-info' : 'pill-neutral'}">${swarm.workingCount}/${swarm.workerCount} active</span>
+        <span class="pill ${swarm.workingCount > 0 ? 'pill-info' : 'pill-neutral'}">${swarm.workingCount}/${liveCount} active</span>
         <span class="pill pill-neutral">${swarm.boardMessages} msgs</span>
       </div>
     </div>
     <div class="orch-meta">
       <span>Workers合計: <strong>${swarm.totals.calls}</strong> calls · New <strong>${esc(fmtK(swarm.totals.uncachedInput))}</strong> · Cache <strong>${esc(fmtK(swarm.totals.cacheRead))}</strong> · Out <strong>${esc(fmtK(swarm.totals.output))}</strong></span>
     </div>
-    ${rows ? `<div class="orch-list">${rows}</div>` : `<div class="status-note">ワーカー未追加</div>`}
+    ${liveSectionHtml}
+    ${retiredSectionHtml}
   </div>`;
 }
 
@@ -547,7 +595,7 @@ function renderMonitorBody(): void {
   const modelLabel = selected.model || latest?.model || '';
   const caches = selected.modelCaches ?? [];
   const orchHtml = selected.isOrchestrator && caches.length >= 2 ? renderOrchestratorCard(caches, settings) : '';
-  const swarmHtml = selected.isSwarm && selected.swarm ? renderSwarmCard(selected.swarm) : '';
+  const swarmHtml = selected.isSwarm && selected.swarm ? renderSwarmCard(selected.swarm, selected.conversationId) : '';
 
   let contextCardHtml = '';
   let freshnessCardHtml = '';

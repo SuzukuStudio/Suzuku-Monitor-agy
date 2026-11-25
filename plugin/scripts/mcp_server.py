@@ -101,6 +101,7 @@ class ContextMonitorServer:
             "isOrchestrator": bool(s.get("isOrchestrator")),
             "isSwarm": bool(s.get("isSwarm")),
             "swarmWorkers": int(swarm_info.get("workerCount") or 0) if swarm_info else 0,
+            "swarmLiveWorkers": int(swarm_info.get("liveWorkerCount") or 0) if swarm_info else 0,
             "justCompacted": just_compacted,
             "isActive": bool(s.get("isActive")),
             "isMostRecent": bool(s.get("isMostRecent")),

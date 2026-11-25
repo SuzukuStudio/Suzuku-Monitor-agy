@@ -6,6 +6,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -797,6 +798,7 @@ class ContextMonitorTests(unittest.TestCase):
         w_impl_cid = "w1111111-0000-0000-0000-000000000002"
         w_adv_cid = "w2222222-0000-0000-0000-000000000003"
         w_dead_cid = "w3333333-0000-0000-0000-000000000004"
+        w_stop_cid = "w4444444-0000-0000-0000-000000000006"
         plain_cid = "p4444444-0000-0000-0000-000000000005"
 
         coord_tp = self.brain_dir / coord_cid / ".system_generated" / "logs" / "transcript.jsonl"
@@ -880,6 +882,23 @@ class ContextMonitorTests(unittest.TestCase):
             ],
         )
 
+        # Stopped worker
+        _write_fixture_transcript(
+            self.brain_dir / w_stop_cid / ".system_generated" / "logs" / "transcript.jsonl",
+            [
+                {
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(140),
+                    "model": "gemini-4-hydrogen-high",
+                    "input_tokens": 4000,
+                    "cache_read_tokens": 1000,
+                    "output_tokens": 50,
+                    "tool_calls": [{"name": "swarm_wait"}],
+                }
+            ],
+        )
+
         swarm_dir = self.brain_dir / coord_cid / ".system_generated" / "swarm"
         swarm_dir.mkdir(parents=True, exist_ok=True)
         (swarm_dir / "swarm.json").write_text(
@@ -918,6 +937,13 @@ class ContextMonitorTests(unittest.TestCase):
                             "model": "gemini-3.8-flash-high",
                             "killed": True,
                         },
+                        "paused-helper": {
+                            "conversation_id": w_stop_cid,
+                            "role": "worker",
+                            "model": "gemini-4-hydrogen-high",
+                            "desired_state": "stopped",
+                            "killed": False,
+                        },
                     },
                 }
             ),
@@ -944,18 +970,21 @@ class ContextMonitorTests(unittest.TestCase):
         swarm = parsed["swarm"]
         self.assertIsNotNone(swarm)
         self.assertEqual(swarm["title"], "Minimal Swarm Prototype")
-        self.assertEqual(swarm["workerCount"], 3)
+        self.assertEqual(swarm["workerCount"], 4)
+        self.assertEqual(swarm["liveWorkerCount"], 2)
+        self.assertEqual(swarm["retiredWorkerCount"], 2)
         self.assertEqual(swarm["workingCount"], 1)
         self.assertEqual(swarm["boardMessages"], 2)
 
-        # Coordinator tokens (20k) must NOT be double-counted into worker totals
+        # Coordinator tokens (20k) must NOT be double-counted into worker totals,
+        # while both live and retired workers remain included in cumulative totals.
         self.assertEqual(
             swarm["totals"],
             {
-                "calls": 4,
-                "uncachedInput": 35000,
-                "cacheRead": 12000,
-                "output": 1000,
+                "calls": 5,
+                "uncachedInput": 39000,
+                "cacheRead": 13000,
+                "output": 1050,
             },
         )
         by_name = {w["name"]: w for w in swarm["workers"]}
@@ -965,6 +994,7 @@ class ContextMonitorTests(unittest.TestCase):
         self.assertEqual(by_name["implementer"]["calls"], 2)
         self.assertEqual(by_name["advisor"]["status"], "waiting")
         self.assertEqual(by_name["old-helper"]["status"], "killed")
+        self.assertEqual(by_name["paused-helper"]["status"], "stopped")
 
         # Non-swarm transcript reports isSwarm=False and swarm=None
         plain_tp = self.brain_dir / plain_cid / ".system_generated" / "logs" / "transcript.jsonl"
@@ -1152,8 +1182,121 @@ class ContextMonitorTests(unittest.TestCase):
         self.assertEqual([s["conversationId"] for s in sc["sessions"]], [coord_cid, other_cid])
         self.assertTrue(sc["sessions"][0]["isSwarm"])
         self.assertEqual(sc["sessions"][0]["swarmWorkers"], 1)
+        self.assertEqual(sc["sessions"][0]["swarmLiveWorkers"], 1)
         self.assertIn("[Swarm]", res["content"][0]["text"])
         self.assertEqual(sc["selected"]["swarm"]["totals"]["calls"], 2)
+
+    def test_swarm_all_retired_counts_and_ui_bundle(self) -> None:
+        coord_cid = "c5555555-0000-0000-0000-000000000001"
+        w_killed_cid = "w5555555-0000-0000-0000-000000000002"
+        w_stopped_cid = "w5555555-0000-0000-0000-000000000003"
+
+        coord_tp = self.brain_dir / coord_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        _write_fixture_transcript(
+            coord_tp,
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": _iso_ago(120), "content": "/swarm retired"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(110),
+                    "model": "gemini-4-neon-high",
+                    "input_tokens": 10000,
+                    "cache_read_tokens": 0,
+                    "output_tokens": 200,
+                    "tool_calls": [{"name": "swarm"}],
+                },
+            ],
+        )
+        _write_fixture_transcript(
+            self.brain_dir / w_killed_cid / ".system_generated" / "logs" / "transcript.jsonl",
+            [
+                {
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(90),
+                    "model": "gemini-4-hydrogen-high",
+                    "input_tokens": 7000,
+                    "cache_read_tokens": 3000,
+                    "output_tokens": 150,
+                    "tool_calls": [{"name": "read_file"}],
+                }
+            ],
+        )
+        _write_fixture_transcript(
+            self.brain_dir / w_stopped_cid / ".system_generated" / "logs" / "transcript.jsonl",
+            [
+                {
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": _iso_ago(80),
+                    "model": "gemini-4-carbon-high",
+                    "input_tokens": 8000,
+                    "cache_read_tokens": 2000,
+                    "output_tokens": 250,
+                    "tool_calls": [],
+                }
+            ],
+        )
+
+        swarm_dir = self.brain_dir / coord_cid / ".system_generated" / "swarm"
+        swarm_dir.mkdir(parents=True, exist_ok=True)
+        (swarm_dir / "members.json").write_text(
+            json.dumps(
+                {
+                    "title": "All Retired Swarm",
+                    "members": {
+                        "coordinator": {"conversation_id": coord_cid, "role": "coordinator"},
+                        "done-impl": {
+                            "conversation_id": w_killed_cid,
+                            "role": "worker",
+                            "model": "gemini-4-hydrogen-high",
+                            "killed": True,
+                        },
+                        "paused-adv": {
+                            "conversation_id": w_stopped_cid,
+                            "role": "worker",
+                            "model": "gemini-4-carbon-high",
+                            "phase": "stopped",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        parsed = transcript_parser.parse_transcript(coord_tp)
+        swarm = parsed["swarm"]
+        self.assertIsNotNone(swarm)
+        self.assertEqual(swarm["workerCount"], 2)
+        self.assertEqual(swarm["liveWorkerCount"], 0)
+        self.assertEqual(swarm["retiredWorkerCount"], 2)
+        self.assertEqual(swarm["workingCount"], 0)
+        self.assertEqual(
+            swarm["totals"],
+            {
+                "calls": 2,
+                "uncachedInput": 15000,
+                "cacheRead": 5000,
+                "output": 400,
+            },
+        )
+
+        app_html = (PLUGIN_DIR / "ui" / "app.html").read_text(encoding="utf-8")
+        decoded_html = re.sub(
+            r"\\u([0-9a-fA-F]{4})",
+            lambda m: chr(int(m.group(1), 16)),
+            app_html,
+        )
+        self.assertIn("data-swarm-retired-toggle", decoded_html)
+        self.assertIn("aria-expanded", decoded_html)
+        self.assertIn("終了済み (", decoded_html)
+        self.assertIn("▼ 表示", decoded_html)
+        self.assertIn("▲ 閉じる", decoded_html)
+        self.assertIn("稼働中のワーカーはありません", decoded_html)
+        self.assertIn("ワーカー未追加", decoded_html)
+        self.assertIn("swarm-retired-toggle", decoded_html)
+        self.assertIn("swarm-retired-section", decoded_html)
 
     def test_independent_cache_and_context_notification_gates(self) -> None:
         base_settings = {
